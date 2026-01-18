@@ -45,6 +45,7 @@ from simply.utils import registry
 from simply.utils import sampling_lib
 from simply.utils import sharding as sharding_lib
 from simply.utils import tokenization
+from simply import diffusion_lm_lib
 
 ################################################################################
 ## Type aliases.
@@ -364,6 +365,7 @@ def create_mask(
     segment_ids: Array,
     kv_segment_ids: Array,
     window_size: int = 0,
+    bidirectional: bool = False,
 ) -> Array:
   """Create a mask for attention.
 
@@ -383,10 +385,14 @@ def create_mask(
   masks = []
 
   # Causal mask.
-  a = einops.rearrange(segment_positions, 'b l -> b l 1')
-  b = einops.rearrange(kv_segment_positions, 'b l -> b 1 l')
-  causal_mask = a >= b
-  masks.append(causal_mask)
+  if not bidirectional:
+    a = einops.rearrange(segment_positions, 'b l -> b l 1')
+    b = einops.rearrange(kv_segment_positions, 'b l -> b 1 l')
+    causal_mask = a >= b
+    masks.append(causal_mask)
+  else:
+    masks.append(jnp.ones((segment_positions.shape[0], segment_positions.shape[1], kv_len), dtype=bool))
+
 
   # Window mask.
   if window_size > 0 and window_size + 1 < kv_len:
@@ -1207,6 +1213,7 @@ class Attention(module.SimplyModule):
   rope_max_timescale: int = 10_000
   rope_scale_factor: float = 1.0
   query_scale: float = -1.0
+  bidirectional: bool = True
 
   def setup(self) -> None:
     if self.use_per_dim_scale:
@@ -1385,7 +1392,10 @@ class Attention(module.SimplyModule):
       # NOTE: These are static masks, and their behavior are global which can
       # result in some limitations. For example, we cannot mask first/last k
       # tokens for each sequence under packed mode.
-      mask = splash_attention.CausalMask((q_seq_len, kv_seq_len))
+      if self.bidirectional:
+        mask = splash_attention.FullMask((q_seq_len, kv_seq_len))
+      else:
+        mask = splash_attention.CausalMask((q_seq_len, kv_seq_len))
       if self.window_size > 0 and self.window_size + 1 < kv_seq_len:
         mask &= splash_attention.LocalMask(
             (q_seq_len, kv_seq_len),
@@ -1452,6 +1462,7 @@ class Attention(module.SimplyModule):
           segment_ids=segment_ids,
           kv_segment_ids=kv_segment_ids,
           window_size=self.window_size,
+          bidirectional=self.bidirectional,
       )
       # Add the group and head dimension.
       mask = einops.rearrange(mask, 'b l1 l2 -> b 1 1 l1 l2')
@@ -1548,6 +1559,7 @@ class TransformerBlock(module.SimplyModule):
   tile_expand_dim: int = 128
   # Implementation of gmm.
   gmm_impl: str = 'ragged_dot'
+  use_bidirectional_attention: bool = False
 
   @property
   def expand_dim(self) -> int:
@@ -1637,6 +1649,7 @@ class TransformerBlock(module.SimplyModule):
         rope_max_timescale=self.rope_max_timescale,
         rope_scale_factor=self.rope_scale_factor,
         query_scale=self.query_scale,
+        bidirectional=self.use_bidirectional_attention,
     )
     if self.use_moe:
       self.ffn = MoEFeedForward(
@@ -1859,6 +1872,7 @@ class TransformerLM(module.SimplyModule):
           rope_max_timescale=rope_max_timescale,
           rope_scale_factor=rope_scale_factor,
           query_scale=config.query_scale,
+          use_bidirectional_attention=config.diffusion_lm,
       )
 
     self.blocks = []
@@ -2619,11 +2633,29 @@ def run_experiment(
       config, config.sharding_config, helper.ckpt_mngr, helper.ckpt_dir)
   helper.save_state_info(state)
 
+  if config.diffusion_lm:
+    diffusion_mask_key = jax.random.key(config.diffusion_mask_seed)
+    diffusion_process_index = jax.process_index()
+    diffusion_loss_fn = functools.partial(
+        diffusion_lm_lib.compute_diffusion_train_loss,
+        right_shift=config.diffusion_right_shift,
+        collect_extra_loss_fn=collect_loss_and_metric,
+    )
+
   # Compile loss, train and learning rate functions.
   @functools.partial(
       jax.jit, donate_argnames=['state'], static_argnames=['add_log_info']
   )
   def train_one_step_fn(state, batch, lr, add_log_info=False):
+    if config.diffusion_lm:
+      step = jax.lax.convert_element_type(state['steps'], jnp.uint32)
+      mask_key = jax.random.fold_in(diffusion_mask_key, step)
+      mask_key = jax.random.fold_in(mask_key, diffusion_process_index)
+      batch = diffusion_lm_lib.apply_diffusion_mask_to_batch(
+          batch,
+          mask_key,
+          mask_token_id=config.diffusion_mask_token_id,
+      )
     return train_one_step(
         state=state,
         batch=batch,
@@ -2636,6 +2668,7 @@ def run_experiment(
         clip_update_norm=config.clip_update_norm,
         clip_local_update_rms=config.clip_local_update_rms,
         weight_decay=config.weight_decay,
+        custom_loss_fn=diffusion_loss_fn,
         add_log_info=add_log_info,
         distill_temperature=config.distill_temperature,
         distill_alpha=config.distill_alpha,
@@ -2667,9 +2700,35 @@ def run_experiment(
 
   # Create eval_fn for validation set.
   if config.use_validation_set:
-    loss_fn = common.named_jit(
-        compute_eval_loss, 'validation_loss_fn', model=model
-    )
+    if config.diffusion_lm:
+      loss_fn = common.named_jit(
+          functools.partial(
+              diffusion_lm_lib.compute_diffusion_eval_loss,
+              right_shift=config.diffusion_right_shift,
+              collect_extra_loss_fn=collect_loss_and_metric,
+          ),
+          'validation_loss_fn',
+          model=model,
+      )
+
+      def _eval_batch_transform(batch: Batch, step: int) -> Batch:
+        step = jnp.asarray(step, dtype=jnp.uint32)
+        mask_key = jax.random.fold_in(diffusion_mask_key, step)
+        mask_key = jax.random.fold_in(mask_key, diffusion_process_index)
+        return diffusion_lm_lib.apply_diffusion_mask_to_batch(
+            batch,
+            mask_key,
+            mask_token_id=config.diffusion_mask_token_id,
+            time_epsolon=config.diffusion_time_epsilon,
+            scheduler_name=config.diffusion_alpha_scheduler_name,
+        )
+
+      batch_transform_fn = _eval_batch_transform
+    else:
+      loss_fn = common.named_jit(
+          compute_eval_loss, 'validation_loss_fn', model=model
+      )
+      batch_transform_fn = None
     validation_set = data_lib.create_iter_dataset(
         config, training=False
     )
@@ -2678,6 +2737,7 @@ def run_experiment(
         eval_set=validation_set,
         num_eval_steps=config.validation_num_eval_steps,
         loss_fn=loss_fn,
+        batch_transform_fn=batch_transform_fn,
     )
   else:
     eval_fn = None
@@ -2873,7 +2933,14 @@ def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
   return state
 
 
-def run_eval(eval_set, num_eval_steps, loss_fn, state) -> dict[str, Any]:
+def run_eval(
+    eval_set,
+    num_eval_steps,
+    loss_fn,
+    state,
+    *,
+    batch_transform_fn: Callable[[Batch, int], Batch] | None = None,
+) -> dict[str, Any]:
   mean_eval_loss = 0.0
   mean_eval_accuracy = 0.0
   # The `loss_weights` is normally the same as `num_tokens`.
@@ -2887,6 +2954,8 @@ def run_eval(eval_set, num_eval_steps, loss_fn, state) -> dict[str, Any]:
     eval_batch = build_global_array_from_replicated(
         eval_batch, (('replica', 'data'),)
     )
+    if batch_transform_fn is not None:
+      eval_batch = batch_transform_fn(eval_batch, eval_steps)
     eval_batch_stats_info = compute_batch_stats_info(eval_batch)
     eval_loss, extra_output = loss_fn(
         params=state['params'], batch=eval_batch)

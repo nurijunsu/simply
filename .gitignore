@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+
+
+# nurijunsu
+Qwen3-0.6B/
