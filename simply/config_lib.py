@@ -428,6 +428,19 @@ class BaseExperimentConfig(ExperimentConfig):
   dcn_mesh_shape: Mapping[str, int] | None = None
   sharding_config: SimplyConfig = gspmd_sharding()
 
+  # Diffusion LM related:
+  diffusion_lm: bool = False
+  # Token id used to replace masked tokens when diffusion_lm is enabled.
+  diffusion_mask_token_id: int = -1
+  # Default ratio of tokens to mask per batch (scheduler placeholder).
+  diffusion_mask_ratio: float = 0.15
+  # Base seed for diffusion masking.
+  diffusion_mask_seed: int = 0
+  # Whether to use right-shifted targets (LM) or same-position targets (MLM).
+  diffusion_right_shift: bool = False
+  # Placeholder for a future mask-ratio scheduler.
+  diffusion_mask_schedule_name: str = ''
+
 
 @ExperimentConfigRegistry.register
 @dataclasses.dataclass(frozen=True)
@@ -2018,6 +2031,15 @@ def lm_rl_test():
               (20, ('<', 'accuracy', 0.5)),
           )
       ),
+  )
+
+@ExperimentConfigRegistry.register
+def dlm_test():
+  config = lm_test()
+  return dataclasses.replace(
+      config,
+      use_flash_attention=True,
+      diffusion_lm=True,
   )
 
 
