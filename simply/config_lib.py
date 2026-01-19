@@ -429,17 +429,11 @@ class BaseExperimentConfig(ExperimentConfig):
   sharding_config: SimplyConfig = gspmd_sharding()
 
   # Diffusion LM related:
-  diffusion_lm: bool = False
-  # Token id used to replace masked tokens when diffusion_lm is enabled.
   diffusion_mask_token_id: int = -1
-  # Default ratio of tokens to mask per batch (scheduler placeholder).
-  diffusion_mask_ratio: float = 0.15
-  # Base seed for diffusion masking.
-  diffusion_mask_seed: int = 0
-  # Whether to use right-shifted targets (LM) or same-position targets (MLM).
-  diffusion_right_shift: bool = False
-  # Placeholder for a future mask-ratio scheduler.
-  diffusion_mask_schedule_name: str = ''
+  diffusion_alpha_scheduler: str = 'LinearAlphaScheduler'
+  diffusion_seed: int = 42
+  diffusion_right_shift: bool = True
+  diffusion_time_epsilon: float = 1e-5
 
 
 @ExperimentConfigRegistry.register
@@ -2038,8 +2032,12 @@ def dlm_test():
   config = lm_test()
   return dataclasses.replace(
       config,
-      use_flash_attention=True,
-      diffusion_lm=True,
+      train_loop_name='diffusion_lm',
+      diffusion_time_epsilon=1e-5,
+      diffusion_seed=42,
+      diffusion_mask_token_id=-1,
+      diffusion_alpha_scheduler='LinearAlphaScheduler',
+      diffusion_right_shift=True
   )
 
 
