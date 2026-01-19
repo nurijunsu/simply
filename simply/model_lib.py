@@ -45,7 +45,6 @@ from simply.utils import registry
 from simply.utils import sampling_lib
 from simply.utils import sharding as sharding_lib
 from simply.utils import tokenization
-from simply import diffusion_lm_lib
 
 ################################################################################
 ## Type aliases.
@@ -1830,6 +1829,7 @@ class TransformerLM(module.SimplyModule):
       rope_scale_factor = config.global_rope_scale_factor
       if pattern == 'local':
         rope_scale_factor = config.local_rope_scale_factor
+      use_bidirectional_attention = bool(config.train_loop_name == 'diffusion_lm')
       return TransformerBlock(
           config.model_dim,
           config.n_heads,
@@ -1872,7 +1872,7 @@ class TransformerLM(module.SimplyModule):
           rope_max_timescale=rope_max_timescale,
           rope_scale_factor=rope_scale_factor,
           query_scale=config.query_scale,
-          use_bidirectional_attention=config.diffusion_lm,
+          use_bidirectional_attention=use_bidirectional_attention,
       )
 
     self.blocks = []
@@ -2633,29 +2633,11 @@ def run_experiment(
       config, config.sharding_config, helper.ckpt_mngr, helper.ckpt_dir)
   helper.save_state_info(state)
 
-  if config.diffusion_lm:
-    diffusion_mask_key = jax.random.key(config.diffusion_mask_seed)
-    diffusion_process_index = jax.process_index()
-    diffusion_loss_fn = functools.partial(
-        diffusion_lm_lib.compute_diffusion_train_loss,
-        right_shift=config.diffusion_right_shift,
-        collect_extra_loss_fn=collect_loss_and_metric,
-    )
-
   # Compile loss, train and learning rate functions.
   @functools.partial(
       jax.jit, donate_argnames=['state'], static_argnames=['add_log_info']
   )
   def train_one_step_fn(state, batch, lr, add_log_info=False):
-    if config.diffusion_lm:
-      step = jax.lax.convert_element_type(state['steps'], jnp.uint32)
-      mask_key = jax.random.fold_in(diffusion_mask_key, step)
-      mask_key = jax.random.fold_in(mask_key, diffusion_process_index)
-      batch = diffusion_lm_lib.apply_diffusion_mask_to_batch(
-          batch,
-          mask_key,
-          mask_token_id=config.diffusion_mask_token_id,
-      )
     return train_one_step(
         state=state,
         batch=batch,
@@ -2668,7 +2650,6 @@ def run_experiment(
         clip_update_norm=config.clip_update_norm,
         clip_local_update_rms=config.clip_local_update_rms,
         weight_decay=config.weight_decay,
-        custom_loss_fn=diffusion_loss_fn,
         add_log_info=add_log_info,
         distill_temperature=config.distill_temperature,
         distill_alpha=config.distill_alpha,
@@ -2700,35 +2681,9 @@ def run_experiment(
 
   # Create eval_fn for validation set.
   if config.use_validation_set:
-    if config.diffusion_lm:
-      loss_fn = common.named_jit(
-          functools.partial(
-              diffusion_lm_lib.compute_diffusion_eval_loss,
-              right_shift=config.diffusion_right_shift,
-              collect_extra_loss_fn=collect_loss_and_metric,
-          ),
-          'validation_loss_fn',
-          model=model,
-      )
-
-      def _eval_batch_transform(batch: Batch, step: int) -> Batch:
-        step = jnp.asarray(step, dtype=jnp.uint32)
-        mask_key = jax.random.fold_in(diffusion_mask_key, step)
-        mask_key = jax.random.fold_in(mask_key, diffusion_process_index)
-        return diffusion_lm_lib.apply_diffusion_mask_to_batch(
-            batch,
-            mask_key,
-            mask_token_id=config.diffusion_mask_token_id,
-            time_epsolon=config.diffusion_time_epsilon,
-            scheduler_name=config.diffusion_alpha_scheduler_name,
-        )
-
-      batch_transform_fn = _eval_batch_transform
-    else:
-      loss_fn = common.named_jit(
-          compute_eval_loss, 'validation_loss_fn', model=model
-      )
-      batch_transform_fn = None
+    loss_fn = common.named_jit(
+        compute_eval_loss, 'validation_loss_fn', model=model
+    )
     validation_set = data_lib.create_iter_dataset(
         config, training=False
     )
@@ -2737,7 +2692,6 @@ def run_experiment(
         eval_set=validation_set,
         num_eval_steps=config.validation_num_eval_steps,
         loss_fn=loss_fn,
-        batch_transform_fn=batch_transform_fn,
     )
   else:
     eval_fn = None

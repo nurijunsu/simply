@@ -34,6 +34,7 @@ from typing import Sequence
 from absl import flags
 from absl import logging
 from simply import config_lib
+from simply import diffusion_lm_lib  # pylint: disable=unused-import
 from simply import model_lib
 from simply import rl_lib  # pylint: disable=unused-import
 from simply.utils import common
