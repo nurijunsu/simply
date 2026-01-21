@@ -23,6 +23,10 @@ from absl import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
+import seqio
+from seqio import vocabularies as seqio_vocabularies
+from sentencepiece import sentencepiece_model_pb2
+import sentencepiece as sentencepiece_processor
 
 from simply import data_lib
 from simply import model_lib
@@ -32,6 +36,7 @@ from simply.utils import experiment_helper as exp_helper
 from simply.utils import optimizers as opt_lib
 from simply.utils import registry
 from simply.utils import sharding as sharding_lib
+from simply.utils import tokenization
 
 Batch = MutableMapping[str, np.ndarray | jnp.ndarray]
 CollectExtraLossFn = Callable[[Any], tuple[jnp.ndarray, dict[str, Any]]]
@@ -84,6 +89,106 @@ class CosineAlphaScheduler(BaseAlphaScheduler):
 
   def alpha_derivative(self, t: jnp.ndarray) -> jnp.ndarray:
     return -(jnp.pi / 2) * jnp.sin((jnp.pi / 2) * (1 - t))
+
+
+def _ensure_sentencepiece_mask_token(
+    vocab: seqio_vocabularies.SentencePieceVocabulary,
+    mask_token: str,
+) -> int:
+  model_context = vocab._model_context()
+  sp_model = model_context.sp_model
+  model = sentencepiece_model_pb2.ModelProto.FromString(sp_model)
+  pieces = [piece.piece for piece in model.pieces]
+  word_boundary = '\u2581'
+  for candidate in (mask_token, f'{word_boundary}{mask_token}'):
+    if candidate in pieces:
+      return pieces.index(candidate)
+  model.pieces.add(
+      piece=f'{word_boundary}{mask_token}',
+      score=0.0,
+      type=sentencepiece_model_pb2.ModelProto.SentencePiece.USER_DEFINED,
+  )
+  sp_model = model.SerializeToString()
+  tokenizer = sentencepiece_processor.SentencePieceProcessor()
+  tokenizer.LoadFromSerializedProto(sp_model)
+  vocab._model = type(model_context)(tokenizer=tokenizer, sp_model=sp_model)
+  return len(model.pieces) - 1
+
+
+def _resolve_vocab_from_dataset_name(dataset_name: str):
+  if not dataset_name:
+    return None
+  if dataset_name.startswith('simply_json:'):
+    return None
+  task_name = dataset_name
+  if task_name.startswith('simply_det:'):
+    task_name = task_name.removeprefix('simply_det:')
+  for candidate in (task_name, dataset_name):
+    try:
+      task_or_mixture = seqio.get_mixture_or_task(candidate)
+      break
+    except ValueError:
+      task_or_mixture = None
+  if task_or_mixture is None:
+    return None
+  output_features = task_or_mixture.output_features
+  if not output_features:
+    return None
+  if 'targets' in output_features:
+    return output_features['targets'].vocabulary
+  return next(iter(output_features.values())).vocabulary
+
+
+def _resolve_mask_token_id(config) -> int:
+  if config.diffusion_mask_token_id >= 0:
+    return config.diffusion_mask_token_id
+  vocab = None
+  if config.vocab_name:
+    vocab = tokenization.TokenizerRegistry.get_instance(config.vocab_name)
+  else:
+    vocab = _resolve_vocab_from_dataset_name(
+        getattr(config, 'dataset_name', '')
+    )
+  if vocab is None:
+    raise ValueError(
+        'vocab_name must be set (or dataset_name must be a SeqIO task) to '
+        'resolve <|MASK|>.'
+    )
+  mask_token = '<|MASK|>'
+  if isinstance(vocab, tokenization.HuggingFaceVocab):
+    tokenizer = vocab.tokenizer
+    mask_id = tokenizer.token_to_id(mask_token)
+    if mask_id is None:
+      tokenizer.add_special_tokens([mask_token])
+      mask_id = tokenizer.token_to_id(mask_token)
+    if mask_id is None:
+      raise ValueError(f'Unable to add {mask_token} to tokenizer.')
+    if mask_id >= config.vocab_size:
+      raise ValueError(
+          f'{mask_token} id {mask_id} exceeds vocab_size={config.vocab_size}.'
+      )
+    return int(mask_id)
+  if isinstance(vocab, seqio_vocabularies.SentencePieceVocabulary):
+    mask_id = _ensure_sentencepiece_mask_token(vocab, mask_token)
+    if mask_id >= config.vocab_size:
+      raise ValueError(
+          f'{mask_token} id {mask_id} exceeds vocab_size={config.vocab_size}.'
+      )
+    return int(mask_id)
+  if hasattr(vocab, 'encode') and hasattr(vocab, 'decode'):
+    token_ids = vocab.encode(mask_token)
+    if not token_ids or len(token_ids) != 1:
+      raise ValueError(
+          f'{mask_token} is not a single token in vocab {config.vocab_name}.'
+      )
+    if vocab.decode(token_ids) != mask_token:
+      raise ValueError(
+          f'{mask_token} does not round-trip in vocab {config.vocab_name}.'
+      )
+    return int(token_ids[0])
+  raise ValueError(
+      f'Unsupported vocab type for {config.vocab_name} when resolving {mask_token}.'
+  )
 
 
 def apply_diffusion_mask_to_batch(
@@ -273,6 +378,7 @@ def run_experiment(
       config, config.sharding_config, helper.ckpt_mngr, helper.ckpt_dir)
   helper.save_state_info(state)
 
+  mask_token_id = _resolve_mask_token_id(config)
   diffusion_mask_key = jax.random.key(config.diffusion_seed)
   diffusion_process_index = jax.process_index()
   diffusion_loss_fn = functools.partial(
@@ -292,7 +398,7 @@ def run_experiment(
     batch = apply_diffusion_mask_to_batch(
         batch,
         mask_key,
-        mask_token_id=config.diffusion_mask_token_id,
+        mask_token_id=mask_token_id,
         time_epsilon=config.diffusion_time_epsilon,
         scheduler_name=scheduler_name,
     )
@@ -354,7 +460,7 @@ def run_experiment(
       return apply_diffusion_mask_to_batch(
           batch,
           mask_key,
-          mask_token_id=config.diffusion_mask_token_id,
+          mask_token_id=mask_token_id,
           time_epsilon=config.diffusion_time_epsilon,
           scheduler_name=scheduler_name,
       )
