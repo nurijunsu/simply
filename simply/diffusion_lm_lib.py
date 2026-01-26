@@ -13,13 +13,16 @@
 # limitations under the License.
 """Diffusion LM helpers (masking, loss, and training loop)."""
 
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
+import dataclasses
 import functools
+import math
 import time
 from typing import Any, ClassVar
 import warnings
 
 from absl import logging
+import einops
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -33,12 +36,22 @@ from simply import model_lib
 from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
 from simply.utils import experiment_helper as exp_helper
+from simply.utils import module
 from simply.utils import optimizers as opt_lib
 from simply.utils import registry
+from simply.utils import sampling_lib
 from simply.utils import sharding as sharding_lib
 from simply.utils import tokenization
 
 Batch = MutableMapping[str, np.ndarray | jnp.ndarray]
+PRNGKey = jax.typing.ArrayLike
+PyTree = common.PyTree
+Array = common.Array
+SamplingParams = sampling_lib.SamplingParams
+SamplingState = model_lib.SamplingState
+SamplingOutput = model_lib.SamplingOutput
+compute_log_likelihood = model_lib.compute_log_likelihood
+pad_along_axis = model_lib.pad_along_axis
 CollectExtraLossFn = Callable[[Any], tuple[jnp.ndarray, dict[str, Any]]]
 
 
@@ -574,3 +587,578 @@ def run_experiment(
     logging.info('Training is early stopped!')
   helper.close(final_result)
   return final_result
+  
+
+@dataclasses.dataclass(frozen=True)
+class DiffusionSamplingParams(sampling_lib.SamplingParams):
+  """Sampling parameters for diffusion decoding."""
+
+  chunk_size: int = 128
+  steps: int = 128
+  remasking: str = 'low_confidence'
+  stochastic_transfer: bool = False
+  right_shift_logits: bool = False
+  mask_token_id: int | None = None
+  scheduler_name: str = 'LinearAlphaScheduler'
+
+  def get_decoding_schedule(
+      self, min_input_length: int, max_input_length: int
+      ) -> sampling_lib.DecodingSchedule:
+    min_input_length = int(min_input_length)
+    prefill_size = (
+        (min_input_length + self.chunk_size - 1) // self.chunk_size
+    ) * self.chunk_size
+    begin_position = min_input_length - 1
+
+    end_position_exclusive = min(
+        self.max_seq_len - 1,
+        # Ensure int to avoid overflow.
+        int(max_input_length) + self.max_decode_steps - 1,
+    )
+    prefill_size = min(prefill_size, end_position_exclusive + 1)
+
+    return sampling_lib.DecodingSchedule(
+        prefill_size=prefill_size,
+        begin_position=begin_position,
+        end_position=end_position_exclusive,
+        chunk_size=self.chunk_size,
+    )
+
+
+def _reverse_transfer_probabilities(
+    steps: int, scheduler_name: str
+) -> jnp.ndarray:
+  step_ids = jnp.arange(steps, dtype=jnp.float32)
+  s = (steps - 1 - step_ids) / steps
+  t = (steps - step_ids) / steps
+  if scheduler_name == 'LinearAlphaScheduler':
+    alpha_s = 1.0 - s
+    alpha_t = 1.0 - t
+  elif scheduler_name == 'CosineAlphaScheduler':
+    alpha_s = 1 - jnp.cos((jnp.pi / 2) * (1 - s))
+    alpha_t = 1 - jnp.cos((jnp.pi / 2) * (1 - t))
+  else:
+    raise ValueError(f'Unknown scheduler: {scheduler_name}')
+  reverse_mask_prob = (1 - alpha_s) / (1 - alpha_t)
+  return 1 - reverse_mask_prob
+
+# TODO(kimjunsu) continue decode doesnt decode all masked tokens. Identify why. 
+def continue_decode(
+    apply_fn: Callable[..., Array],
+    params: PyTree,
+    init_sampling_state: model_lib.SamplingState,
+    extra_inputs: Mapping[str, PyTree] | None = None,
+    temperature: float = 1.0,
+    *,
+    mask_token_id: int,
+    pad_id: int,
+    chunk_size: int,
+    steps: int,
+    remasking: str = 'low_confidence',
+    stochastic_transfer: bool = False,
+    right_shift_logits: bool = False,
+    scheduler_name: str = 'LinearAlphaScheduler',
+) -> model_lib.SamplingState:
+  tokens = init_sampling_state.tokens
+  seq_len = tokens.shape[1]
+  topk_size = min(chunk_size, seq_len)
+  prng_key = init_sampling_state.prng_key
+
+  mask_index = tokens == mask_token_id
+  reverse_probs = _reverse_transfer_probabilities(steps, scheduler_name)
+
+  def compute_num_transfer_tokens(
+      rng_key: jax.Array, mask_index: Array
+  ) -> tuple[jax.Array, Array]:
+    mask_num = jnp.sum(mask_index, axis=1).astype(jnp.int32)
+    if stochastic_transfer:
+      keys = jax.random.split(rng_key, steps + 1)
+      rng_key = keys[0]
+      step_keys = keys[1:]
+
+      def scan_fn(mask_num, inputs):
+        rev_prob, step_key = inputs
+        num = jax.random.binomial(step_key, mask_num, rev_prob)
+        num = num.astype(jnp.int32)
+        num = jnp.minimum(num, mask_num)
+        mask_num = mask_num - num
+        return mask_num, num
+
+      _, nums = jax.lax.scan(
+          scan_fn, mask_num, (reverse_probs, step_keys)
+      )
+    else:
+      def scan_fn(mask_num, rev_prob):
+        num = jnp.round(mask_num * rev_prob).astype(jnp.int32)
+        num = jnp.minimum(num, mask_num)
+        mask_num = mask_num - num
+        return mask_num, num
+
+      _, nums = jax.lax.scan(scan_fn, mask_num, reverse_probs)
+    num_transfer_tokens = jnp.transpose(nums, (1, 0))
+    return rng_key, num_transfer_tokens
+
+  prng_key, num_transfer_tokens = compute_num_transfer_tokens(
+      prng_key, mask_index
+  )
+
+  pos_idx = jnp.arange(seq_len)[None, :]
+  segment_positions = jnp.broadcast_to(pos_idx, tokens.shape)
+
+  def scatter_indices(idx: Array, take: Array) -> Array:
+    mask = jnp.zeros((seq_len,), dtype=jnp.bool_)
+    return mask.at[idx].set(take)
+
+  def step_fn(carry, num_transfer):
+    prng_key, tokens = carry
+    prng_key, gumbel_key, rand_key = jax.random.split(prng_key, 3)
+    logits, _ = apply_fn(
+        params,
+        tokens,
+        segment_positions=segment_positions,
+        extra_inputs=extra_inputs,
+    )
+    if right_shift_logits:
+      logits = jnp.concatenate([logits[:, :1], logits[:, :-1]], axis=1)
+
+    logits_with_noise = sampling_lib.add_gumbel_noise(
+        logits, temperature=temperature, rng=gumbel_key
+    )
+    x0 = jnp.argmax(logits_with_noise, axis=-1)
+
+    if remasking == 'low_confidence':
+      probs = jax.nn.softmax(logits, axis=-1)
+      x0_p = jnp.take_along_axis(probs, x0[..., None], axis=-1).squeeze(-1)
+    elif remasking == 'random':
+      x0_p = jax.random.uniform(rand_key, x0.shape)
+    else:
+      raise ValueError(f'Unknown remasking: {remasking}')
+
+    mask_index = tokens == mask_token_id
+    x0 = jnp.where(mask_index, x0, tokens)
+    confidence = jnp.where(mask_index, x0_p, jnp.full_like(x0_p, -jnp.inf))
+
+    _, topk_idx = jax.lax.top_k(confidence, k=topk_size)
+    k = num_transfer
+    take = jnp.arange(topk_size)[None, :] < k[:, None]
+    transfer_index = jax.vmap(scatter_indices)(topk_idx, take)
+    tokens = jnp.where(transfer_index, x0, tokens)
+    return (prng_key, tokens), None
+
+  num_transfer_tokens = num_transfer_tokens[:, :steps]
+  num_transfer_tokens = jnp.transpose(num_transfer_tokens, (1, 0))
+  (prng_key, tokens), _ = jax.lax.scan(
+      step_fn, (prng_key, tokens), num_transfer_tokens
+  )
+  pad_mask = tokens == pad_id
+  rev_pad = jnp.flip(pad_mask, axis=1)
+  has_nonpad = jnp.any(~rev_pad, axis=1)
+  first_nonpad = jnp.argmax(~rev_pad, axis=1)
+  trailing_pad = jnp.where(has_nonpad, first_nonpad, seq_len)
+  last_nonpad = jnp.where(has_nonpad, seq_len - trailing_pad - 1, 0)
+  return dataclasses.replace(
+      init_sampling_state,
+      prng_key=prng_key,
+      tokens=tokens,
+      position=jnp.min(last_nonpad),
+      token_logprobs=init_sampling_state.token_logprobs,
+      token_scores=init_sampling_state.token_scores,
+  )
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(kw_only=True, frozen=True)
+class DiffusionSamplingState(model_lib.SamplingState):
+  def mask_and_pad_to(
+      self,
+      length: int,
+      mask_block_size: int,
+      *,
+      mask_id: int,
+      pad_id: int = 0,
+      mask_all: bool = False,
+  ) -> 'DiffusionSamplingState':
+    """Pads to `length` and masks a trailing pad block for diffusion decoding.
+
+    If `mask_all` is False, pads tokens/logprobs/scores to `length`, then masks
+    up to `mask_block_size` trailing pad positions (if at least that many pads
+    exist). If `mask_all` is True, does not pad and instead masks all existing
+    pad positions.
+
+    Args:
+      length: Target sequence length to pad to when `mask_all` is False.
+      mask_block_size: Maximum number of trailing pad tokens to mask.
+      mask_id: Token id to use for masked positions.
+      pad_id: Token id used for padding in the sequence.
+      mask_all: Whether to mask all pad positions without padding.
+
+    Returns:
+      A new `DiffusionSamplingState` with updated tokens/logprobs/scores.
+    """
+    tokens = self.tokens
+    token_logprobs = self.token_logprobs
+    token_scores = self.token_scores 
+
+    if not mask_all:
+      tokens = model_lib.pad_to_along_axis(tokens, length, axis=1)
+      token_logprobs = model_lib.pad_to_along_axis(
+          token_logprobs, length, axis=1
+      )
+      token_scores = model_lib.pad_to_along_axis(
+          token_scores, length, axis=1
+      )
+
+    seq_len = tokens.shape[1]
+    pad_mask = tokens == pad_id
+    if mask_all:
+      mask_indices = pad_mask
+    else:
+      rev_pad = jnp.flip(pad_mask, axis=1)
+      has_nonpad = jnp.any(~rev_pad, axis=1)
+      first_nonpad = jnp.argmax(~rev_pad, axis=1)
+      trailing_pad = jnp.where(has_nonpad, first_nonpad, seq_len)
+      mask_len = jnp.where(
+          trailing_pad > mask_block_size, mask_block_size, 0
+      )
+      mask_start = seq_len - trailing_pad
+      pos_idx = jnp.arange(seq_len)[None, :]
+      mask_indices = (
+          (pos_idx >= mask_start[:, None])
+          & (pos_idx < (mask_start + mask_len)[:, None])
+          & pad_mask
+      )
+
+    tokens = jnp.where(mask_indices, mask_id, tokens)
+    return dataclasses.replace(
+        self,
+        tokens=tokens,
+        token_logprobs=token_logprobs,
+        token_scores=token_scores,
+    )
+
+
+class DLMInterface:
+
+  def __init__(
+      self,
+      model: module.SimplyModule,
+      params: PyTree,
+      vocab: tokenization.SimplyVocab[str] | None = None,
+      input_processor: sampling_lib.InputProcessorInterface | None = None,
+      default_sampling_params: DiffusionSamplingParams | None = None,
+      bos_id: int | None = None,
+      pad_id: int | None = None,
+      mask_token_id: int | None = None,
+      extra_eos_ids: Sequence[int] | None = None,
+      extra_eos_tokens: Sequence[str] | None = None,
+  ) -> None:
+    """An interface to interact with a language model.
+
+    Args:
+      model: The model to use, for example, a TransformerLM instance.
+      params: The `params` to use in `model.apply`.
+      vocab: The vocabulary instance to use. Either `vocab` or `input_processor`
+        should be specified. If `vocab` is specified, it will be used to a
+        instantiate a default input processor for basic text inputs.
+      input_processor: The input processor to use, for specialized input
+        processing. For basic text inputs, it is enough to specify `vocab`.
+      default_sampling_params: Default sampling params for `generate`.
+      bos_id: The bos id to use, if not given then it will use the `bos_id`
+        field of the `vocab`.
+      pad_id: The pad id to use, if not given then it will use the `pad_id`
+        field of the `vocab`.
+      mask_token_id: The mask token id to use for diffusion sampling.
+      extra_eos_ids: Extra eos ids to include.
+      extra_eos_tokens: Extra eos tokens to include.
+    """
+    self.model = model
+    if input_processor:
+      self.input_processor = input_processor
+    else:
+      assert vocab is not None, 'Must provide one of vocab or input_processor!'
+      self.input_processor = sampling_lib.BasicTextInputProcessor(
+          vocab,
+          bos_id_override=bos_id,
+          pad_id_override=pad_id,
+          extra_eos_ids=extra_eos_ids,
+          extra_eos_tokens=extra_eos_tokens,
+      )
+    self.mask_token_id = mask_token_id
+    self.default_sampling_params = default_sampling_params or DiffusionSamplingParams()
+
+    self.decode_fn = jax.jit(
+        common.named_partial_fn(
+            continue_decode,
+            'decode_fn',
+            apply_fn=model.apply,
+        ),
+        donate_argnames='init_sampling_state',
+        static_argnames=(
+            'chunk_size',
+            'steps',
+            'remasking',
+            'stochastic_transfer',
+            'right_shift_logits',
+            'scheduler_name',
+        ),
+    )
+    self.mask_and_pad_to = jax.jit(
+        DiffusionSamplingState.mask_and_pad_to,
+        donate_argnames='self',
+        static_argnames=['length', 'mask_all'],
+    )
+    self.model_params = params
+
+  @property
+  def eos_ids(self) -> list[int]:
+    return self.input_processor.eos_ids
+
+  def generate(
+      self,
+      input_text: (
+          sampling_lib.SamplingInput | Sequence[sampling_lib.SamplingInput]
+      ),
+      prng_key: int | PRNGKey | None = None,
+      params: PyTree = None,
+      sampling_params: DiffusionSamplingParams | None = None,
+      include_eos_in_output_text: bool = False,
+      batch_size: int | None = None,
+  ) -> list[model_lib.SamplingOutput] | list[list[model_lib.SamplingOutput]]:
+    """Generate samples from a given input text.
+
+    Args:
+      input_text: Single input or sequence of inputs to generate samples for.
+        Input can be either string or sequence of Chunks.
+      prng_key: A PRNGKey or seed for controlling the randomness. The key would
+        be released inside, and cannot be reused.
+      params: parameters of the model, if None, use the default parameters.
+      sampling_params: Sampling params to use for the generation.
+      include_eos_in_output_text: Whether to include the eos token when
+        generating the `output_text` field of the sampling outputs. Note that
+        even if this is set to `True`, the `vocab.decode` can still skip the eos
+        token.
+      batch_size: The batch size to use for the generation. If not specified,
+        the batch size will be inferred from the length of the input text.
+        
+    Returns:
+      If the `input_text` is a single text string or a single raw sequence,
+      returns a list of `SamplingOutput`, else if the `input_text` is a
+      list of text strings or a list of raw sequences, returns a list of list of
+      `SamplingOutput`.
+
+      The result `SamplingOutput` instances for each `input_text` are
+      ranked by the `sort_by` field of the `sampling_params`.
+
+      Note that the eos token and bos token are included in the
+      `output_token_ids` and `input_token_ids` field of the `SamplingOutput`,
+      but the `input_token_scores` will not include the bos token so its length
+      is one less than `input_token_ids`.
+    """
+    if params is None:
+      params = self.model_params
+
+    if prng_key is None:
+      seed = int(time.time() * 1000)
+      # This is to guarantee all hosts have the same seed.
+      seed = jax.experimental.multihost_utils.broadcast_one_to_all(seed)
+      prng_key = jax.random.key(seed=seed)
+    elif isinstance(prng_key, int):
+      prng_key = jax.random.key(seed=prng_key)
+    if sampling_params is None:
+      sampling_params = self.default_sampling_params
+
+    is_singleton_input = isinstance(input_text, str)
+    if input_text and isinstance(input_text[0], sampling_lib.Chunk):
+      is_singleton_input = True
+
+    if is_singleton_input:
+      raw_inputs = [sampling_lib.input_as_chunks(input_text)]
+    else:
+      raw_inputs = [sampling_lib.input_as_chunks(x) for x in input_text]
+
+    unpadded_inputs = [
+        self.input_processor.encode(
+            x, max_input_len=sampling_params.max_input_len)
+        for x in raw_inputs
+    ]
+    processed_input = sampling_lib.ProcessedInputBatch.from_unpadded_inputs(
+        unpadded_inputs, pad_id=self.input_processor.pad_id
+    )
+
+    # Compute before padding the batch which may create length zero inputs.
+    decoding_schedule = sampling_params.get_decoding_schedule(
+        min_input_length=processed_input.min_length,
+        max_input_length=processed_input.max_length,
+    )
+
+    if batch_size is not None:
+      if processed_input.batch_size > batch_size:
+        raise ValueError(
+            f'Batch size {processed_input.batch_size=} is larger than the'
+            f' specified batch size {batch_size=}.'
+        )
+      if processed_input.batch_size < batch_size:
+        processed_input = processed_input.pad_batch_to(batch_size)
+        logging.info('processed_input=%s after batch padding', processed_input)
+
+    mask_token_id = sampling_params.mask_token_id
+    if mask_token_id is None:
+      mask_token_id = self.mask_token_id
+    if mask_token_id is None:
+      raise ValueError(
+          'mask_token_id must be set in DiffusionSamplingParams or DLMInterface.'
+      )
+    processed_input = processed_input.pad_to(
+        max(
+            decoding_schedule.get_next_length(processed_input.max_length - 1),
+            decoding_schedule.prefill_size,
+        ),
+        pad_id=self.input_processor.pad_id,
+    )
+    
+    if sampling_params.num_samples > 1:
+      processed_input = processed_input.repeat(sampling_params.num_samples)
+
+    position = decoding_schedule.begin_position
+
+    token_scores = jnp.zeros(
+        (processed_input.batch_size, decoding_schedule.prefill_size + 1),
+        dtype=jnp.float32,
+    )
+    token_logprobs = jnp.zeros_like(token_scores)
+
+    sampling_state = DiffusionSamplingState(
+        prng_key=jnp.copy(prng_key),
+        position=jnp.array(position),
+        decode_state=None,
+        tokens=processed_input.tokens,
+        token_logprobs=token_logprobs,
+        token_scores=token_scores,
+        input_lens=jnp.reshape(processed_input.lengths, [-1, 1]),
+        max_decode_steps=einops.repeat(
+            jnp.array(sampling_params.max_decode_steps),
+            '-> b 1',
+            b=processed_input.batch_size,
+        ),
+        eos_ids=jnp.array(self.input_processor.eos_ids, dtype=jnp.int32),
+    )
+
+    # NOTE that `position + 1` is the output position.
+    logging.info('position: %d', position)
+    logging.info('decoding chunk size: %d', decoding_schedule.chunk_size)
+    logging.info('max_input_len: %d', processed_input.max_length)
+    logging.info(
+        'sampling_params.max_decode_steps: %d',
+        sampling_params.max_decode_steps,
+    )
+    logging.info(
+        'sampling_params.max_seq_len: %d', sampling_params.max_seq_len
+    )
+    mask_all = False
+    while position < decoding_schedule.end_position:
+      print(position, decoding_schedule.end_position)
+      chunk_size = sampling_params.chunk_size
+      length = decoding_schedule.get_next_length(position + chunk_size)
+      print(length)
+      sampling_state = self.mask_and_pad_to(
+          sampling_state,
+          length=length,
+          mask_block_size=decoding_schedule.chunk_size,
+          mask_id=mask_token_id,
+          pad_id=self.input_processor.pad_id,
+          mask_all=mask_all,
+      )
+      sampling_state = self.decode_fn(
+          params=params,
+          init_sampling_state=sampling_state,
+          extra_inputs=processed_input.extra_inputs,
+          temperature=sampling_params.temperature,
+          mask_token_id=mask_token_id,
+          pad_id=self.input_processor.pad_id,
+          chunk_size=chunk_size,
+          steps=sampling_params.steps,
+          remasking=sampling_params.remasking,
+          stochastic_transfer=sampling_params.stochastic_transfer,
+          right_shift_logits=sampling_params.right_shift_logits,
+          scheduler_name=sampling_params.scheduler_name,
+      )
+      position = jax.device_get(sampling_state.position)
+      print(position)
+      if jax.device_get(sampling_state.all_has_ended):
+        break
+      mask_all = bool(length >= decoding_schedule.end_position)
+      print(mask_all)
+    # Post process the outputs.
+    all_raw_token_ids = jax.experimental.multihost_utils.process_allgather(
+        sampling_state.tokens, tiled=True
+    ).tolist()
+
+    sample_outputs = []
+    num_outputs = len(raw_inputs) * sampling_params.num_samples
+    for i in range(num_outputs):
+      raw_token_ids = all_raw_token_ids[i]
+      assert isinstance(raw_token_ids, list)
+      assert isinstance(raw_token_ids[0], int)
+      input_token_ids = []
+      input_token_scores = []
+      output_token_ids = []
+      output_token_scores = []
+      output_token_logprobs = []
+      for t, token_id in enumerate(raw_token_ids):
+        if t >= min(
+            # Ensure python int to prevent overflow.
+            int(processed_input.lengths[i])
+            + sampling_params.max_decode_steps,
+            sampling_params.max_seq_len,
+        ):
+          break
+        if t < processed_input.lengths[i]:
+          input_token_ids.append(token_id)
+          if t > 0:
+            input_token_scores.append(0.0)
+        else:
+          output_token_ids.append(token_id)
+          output_token_scores.append(0.0)
+          output_token_logprobs.append(0.0)
+          if token_id in self.input_processor.eos_ids:
+            # Generated eos token can only appear in output_tokens.
+            break
+
+      ends_in_eos = (
+          output_token_ids
+          and output_token_ids[-1] in self.input_processor.eos_ids
+      )
+      if ends_in_eos and not include_eos_in_output_text:
+        output_chunks = self.input_processor.decode(output_token_ids[:-1])
+      else:
+        output_chunks = self.input_processor.decode(output_token_ids)
+
+      input_index = i // sampling_params.num_samples
+      sample_outputs.append(
+          SamplingOutput(
+              input_chunks=raw_inputs[input_index],
+              output_chunks=output_chunks,
+              input_token_ids=input_token_ids,
+              output_token_ids=output_token_ids,
+              output_token_logprobs=output_token_logprobs,
+              input_token_scores=input_token_scores,
+              output_token_scores=output_token_scores,
+              is_truncated=(not ends_in_eos),
+              processed_input=unpadded_inputs[input_index],
+          )
+      )
+
+    if not is_singleton_input:
+      sample_outputs = [
+          sample_outputs[i : i + sampling_params.num_samples]
+          for i in range(0, len(sample_outputs), sampling_params.num_samples)
+      ]
+
+    if sampling_params.sort_by is not None:
+      if is_singleton_input:
+        sample_outputs.sort(key=lambda x: getattr(x, sampling_params.sort_by))
+      else:
+        for batch in sample_outputs:
+          assert isinstance(batch, list)
+          batch.sort(key=lambda x: getattr(x, sampling_params.sort_by))
+
+    return sample_outputs

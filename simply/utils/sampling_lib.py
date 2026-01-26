@@ -26,6 +26,7 @@ from typing import ClassVar, Mapping, Protocol, Sequence
 
 import einops
 import jax
+import jax.numpy as jnp
 import numpy as np
 from simply.utils import common
 from simply.utils import registry
@@ -406,3 +407,26 @@ def create_input_processor(config, **kwargs) -> InputProcessorInterface:
   if input_processor_name is None:
     return BasicTextInputProcessor(**kwargs)
   return InputProcessorRegistry.get(input_processor_name)(**kwargs)
+
+
+def add_gumbel_noise(
+    logits: common.Array,
+    temperature: float,
+    rng: jax.Array | None = None,
+) -> jax.Array:
+  """Utility for Gumbel Softmax sampling."""
+  logits = jnp.asarray(logits, dtype=jnp.float64)
+  temperature = jnp.asarray(temperature, dtype=jnp.float64)
+  if rng is None:
+    rng = jax.random.PRNGKey(
+        np.random.randint(0, np.iinfo(np.uint32).max, dtype=np.uint32)
+    )
+  noise = jax.random.uniform(
+      rng,
+      shape=logits.shape,
+      dtype=jnp.float64,
+      minval=jnp.finfo(jnp.float64).tiny,
+  )
+  gumbel_noise = (-jnp.log(noise)) ** temperature
+  logits_with_noise = jnp.exp(logits) / gumbel_noise
+  return jnp.where(temperature == 0, logits, logits_with_noise)
