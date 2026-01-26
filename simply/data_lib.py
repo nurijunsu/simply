@@ -55,6 +55,7 @@ OPENMIX_V3_100864_V2_VOCAB = os.path.join(VOCABS_DIR, 'spm-100864-openmix_v3-r10
 GEMMA2_VOCAB = os.path.join(VOCABS_DIR, 'gemma2_tokenizer.model')
 GEMMA3_VOCAB = os.path.join(VOCABS_DIR, 'gemma3_cleaned_262144_v2.spiece.model')
 QWEN3_VOCAB = os.path.join(VOCABS_DIR, 'Qwen3')
+QWEN3_VOCAB_SIZE = 151_936
 
 OPENMIX_V1_VOCABS = [
     ('vb100864_openmix_v1', OPENMIX_V1_100864_VOCAB),
@@ -104,6 +105,22 @@ USER_TOKEN = '<reserved_1>'
 ASSISTANT_TOKEN = '<reserved_2>'
 SYSTEM_TOKEN = '<reserved_3>'
 END_OF_MESSAGE_TOKEN = '<reserved_4>'
+QWEN3_IM_START_TOKEN = '<|im_start|>'
+QWEN3_IM_END_TOKEN = '<|im_end|>'
+
+
+_QWEN3_HF_VOCAB = None
+
+
+def _get_qwen3_vocab() -> tokenization.HuggingFaceVocab:
+  global _QWEN3_HF_VOCAB
+  if _QWEN3_HF_VOCAB is None:
+    _QWEN3_HF_VOCAB = tokenization.HuggingFaceVocab(QWEN3_VOCAB)
+  return _QWEN3_HF_VOCAB
+
+
+def _qwen3_eos_id() -> int | None:
+  return _get_qwen3_vocab().eos_id
 
 
 ################################################################################
@@ -177,6 +194,60 @@ def add_c4_task():
     add_pt_task_v1(task_name, source, vocab,
                    use_reduce_concat_split=True)
 add_c4_task()
+
+
+def _qwen3_text_preprocessor(
+    dataset: tf.data.Dataset, *, text_key: str
+) -> tf.data.Dataset:
+  """Tokenizes text with Qwen3 tokenizer via tf.py_function."""
+
+  @seqio.map_over_dataset
+  def tokenize_map(ex: Mapping[str, tf.Tensor]) -> Mapping[str, tf.Tensor]:
+    def py_encode(text):
+      if isinstance(text, bytes):
+        text = text.decode('utf-8')
+      return np.asarray(_get_qwen3_vocab().encode(text), dtype=np.int32)
+
+    tokens = tf.py_function(py_encode, [ex[text_key]], Tout=tf.int32)
+    tokens.set_shape([None])
+    return {'tokens': tokens}
+
+  return tokenize_map(dataset)
+
+
+def add_qwen3_pt_task_v1(name, source, *, text_key: str):
+  seqio.TaskRegistry.remove(name)
+  seqio.TaskRegistry.add(
+      name,
+      source=source,
+      preprocessors=[
+          functools.partial(_qwen3_text_preprocessor, text_key=text_key),
+          functools.partial(
+              t5.data.preprocessors.rekey,
+              key_map={
+                  'inputs': None,
+                  'targets': 'tokens',
+              },
+          ),
+          seqio.preprocessors.append_eos,
+          t5.data.preprocessors.reduce_concat_tokens,
+          t5.data.preprocessors.split_tokens_to_targets_length,
+      ],
+      output_features={
+          'targets': seqio.Feature(
+              seqio.PassThroughVocabulary(QWEN3_VOCAB_SIZE, eos_id=_qwen3_eos_id()),
+              add_eos=False,
+              dtype=tf.int32,
+          ),
+      },
+  )
+
+
+def add_c4_qwen3_task():
+  source = seqio.TfdsDataSource(tfds_name='c4:3.0.1')
+  add_qwen3_pt_task_v1('c4.qwen3', source, text_key='text')
+
+add_c4_qwen3_task()
 
 
 def add_imdb_reviews_task():
@@ -370,6 +441,64 @@ def process_conversation(serialized_conversation):
   return ''.join(text)
 
 
+def _format_qwen3_conversation(serialized_conversation: str) -> str:
+  conversation = json.loads(serialized_conversation)
+  parts = []
+  for message in conversation:
+    role = message['role']
+    content = message['content']
+    parts.append(
+        f'{QWEN3_IM_START_TOKEN}{role}\n{content}{QWEN3_IM_END_TOKEN}\n'
+    )
+  return ''.join(parts)
+
+
+def _qwen3_conversation_preprocessor(
+    dataset: tf.data.Dataset,
+) -> tf.data.Dataset:
+  """Tokenizes SFT conversation examples with Qwen3 tokenizer."""
+
+  @seqio.map_over_dataset
+  def tokenize_map(ex: Mapping[str, tf.Tensor]) -> Mapping[str, tf.Tensor]:
+    def py_encode(json_str):
+      if isinstance(json_str, bytes):
+        json_str = json_str.decode('utf-8')
+      text = _format_qwen3_conversation(json_str)
+      return np.asarray(_get_qwen3_vocab().encode(text), dtype=np.int32)
+
+    tokens = tf.py_function(py_encode, [ex['conversation']], Tout=tf.int32)
+    tokens.set_shape([None])
+    return {'tokens': tokens}
+
+  return tokenize_map(dataset)
+
+
+def add_qwen3_sft_task_v1(name, source):
+  seqio.TaskRegistry.remove(name)
+  seqio.TaskRegistry.add(
+      name,
+      source=source,
+      preprocessors=[
+          _qwen3_conversation_preprocessor,
+          functools.partial(
+              t5.data.preprocessors.rekey,
+              key_map={
+                  'inputs': None,
+                  'targets': 'tokens',
+              },
+          ),
+          seqio.preprocessors.append_eos,
+      ],
+      output_features={
+          'targets': seqio.Feature(
+              seqio.PassThroughVocabulary(QWEN3_VOCAB_SIZE, eos_id=_qwen3_eos_id()),
+              add_eos=False,
+              dtype=tf.int32,
+          ),
+      },
+  )
+
+
 def add_openhermes_2p5_task():
   train = os.path.join(DATASETS_DIR, 'openhermes-2p5/train.tfrecord')
   source = seqio.TFExampleDataSource(
@@ -399,6 +528,18 @@ def add_tulu_v2_task():
         conversation_process_fn=process_conversation)
 
 add_tulu_v2_task()
+
+
+def add_tulu_v2_qwen3_task():
+  train = os.path.join(DATASETS_DIR, 'tulu-v2-sft-mixture/train.tfrecord')
+  source = seqio.TFExampleDataSource(
+      split_to_filepattern={'train': train},
+      feature_description={
+          'conversation': tf.io.FixedLenFeature([], dtype=tf.string),
+          'metadata': tf.io.FixedLenFeature([], dtype=tf.string)})
+  add_qwen3_sft_task_v1('tulu_v2_sft.qwen3', source)
+
+add_tulu_v2_qwen3_task()
 
 ################################################################################
 # Mixtures.
