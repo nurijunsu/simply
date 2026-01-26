@@ -352,6 +352,76 @@ class MixtureConfig:
 
 
 ################################################################################
+# Dataset config presets.
+################################################################################
+
+
+@DataConfigRegistry.register(name='c4.qwen3')
+def c4_qwen3() -> DatasetConfig:
+  """C4 pretraining dataset config using Qwen3 tokenizer."""
+  return DatasetConfig(
+      source=TFDSSourceConfig(name='c4:3.0.1', split='train'),
+      data_key='text',
+      packing=PACKING_CONCAT_SPLIT,
+      lm_format_name='Pretrain',
+      tokenizer_name='Qwen3',
+      add_eos=True,
+      add_bos=False,
+  )
+
+
+@DataConfigRegistry.register(name='tulu_v2_sft.qwen3')
+def tulu_v2_sft_qwen3() -> DatasetConfig:
+  """Tulu v2 SFT dataset config using Qwen3 chat formatting."""
+  return DatasetConfig(
+      source='tulu_v2_sft',
+      data_key='conversation',
+      packing=PACKING_FIRST_FIT,
+      lm_format_name='QwenV2Chat',
+      tokenizer_name='Qwen3',
+      add_bos=False,
+      trainable_roles=('assistant',),
+  )
+
+
+################################################################################
+# TFRecord data sources.
+################################################################################
+
+
+@functools.partial(DataSourceRegistry.register, name='tulu_v2_sft')
+@dataclasses.dataclass(frozen=True)
+class TuluV2SFTSource:
+  """Tulu v2 SFT dataset source from TFRecord files."""
+
+  path: str = os.path.join(DATASETS_DIR, 'tulu-v2-sft-mixture/train.tfrecord')
+  start_index: int | None = None
+  end_index: int | None = None
+
+  @functools.cached_property
+  def _examples(self) -> list[bytes]:
+    import tensorflow as tf  # pylint: disable=g-import-not-at-top
+
+    dataset = tf.data.TFRecordDataset([self.path])
+    records: list[bytes] = []
+    start = self.start_index or 0
+    end = self.end_index
+    for i, record in enumerate(dataset):
+      if i < start:
+        continue
+      if end is not None and i >= end:
+        break
+      records.append(bytes(record.numpy()))
+    return records
+
+  def __len__(self) -> int:
+    return len(self._examples)
+
+  def __getitem__(self, index: int) -> bytes:
+    return self._examples[index]
+
+
+################################################################################
 # JSON data sources (for evaluation/RL).
 ################################################################################
 
@@ -1107,6 +1177,23 @@ def _create_map_dataset(
 ################################################################################
 
 
+def _resolve_dataset_config(ds_config: Any):
+  """Resolve dataset config presets and nested mixture entries."""
+  if isinstance(ds_config, str):
+    return DataConfigRegistry.get_instance(ds_config)
+  if isinstance(ds_config, MixtureConfig):
+    datasets = []
+    changed = False
+    for entry, weight in ds_config.datasets:
+      resolved = _resolve_dataset_config(entry)
+      if resolved is not entry:
+        changed = True
+      datasets.append((resolved, weight))
+    if changed:
+      return dataclasses.replace(ds_config, datasets=tuple(datasets))
+  return ds_config
+
+
 def create_iter_dataset(
     config,
     training: bool = True,
@@ -1139,6 +1226,10 @@ def create_iter_dataset(
     )
     shuffle = False
     num_epochs = config.validation_eval_epochs
+
+  ds_config = _resolve_dataset_config(ds_config)
+  if ds_config is None:
+    raise ValueError('dataset_config must be set for create_iter_dataset().')
 
   # Get config values.
   tokenizer_name = config.vocab_name

@@ -77,6 +77,7 @@ QWEN3_235B_A22B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-235B-A22B/ORBAX')
 QWEN3_4B_THINKING_2507_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-4B-Thinking-2507/ORBAX')
 QWEN3_30B_A3B_THINKING_2507_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-30B-A3B-Thinking-2507/ORBAX')
 QWEN3_235B_A22B_THINKING_2507_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-235B-A22B-Thinking-2507/ORBAX')
+QWEN3_VISION_PAD_ID = 151654
 
 
 ################################################################################
@@ -1736,6 +1737,38 @@ def qwen3_0p6b():
 
 
 @ExperimentConfigRegistry.register
+def qwen3_0p6b_dlm_c4_qwen3():
+  """Diffusion pretraining with Qwen3 tokenizer on C4."""
+  config = qwen3_0p6b()
+  return dataclasses.replace(
+      config,
+      train_loop_name='diffusion_lm',
+      dataset_name='c4.qwen3',
+      dataset_config='c4.qwen3',
+      diffusion_mask_token_id=QWEN3_VISION_PAD_ID,
+      use_validation_set=False,
+  )
+
+
+@ExperimentConfigRegistry.register
+def qwen3_0p6b_dlm_sft_tulu_v2_qwen3():
+  """Diffusion SFT with Qwen3 tokenizer on Tulu v2 SFT."""
+  config = qwen3_0p6b_dlm_c4_qwen3()
+  return dataclasses.replace(
+      config,
+      num_train_steps=2000,
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=1e-4,
+          warmup_steps=100,
+          steps_after_decay=10,
+          end_decay=0.1,
+      ),
+      dataset_name='tulu_v2_sft.qwen3',
+      dataset_config='tulu_v2_sft.qwen3',
+  )
+
+
+@ExperimentConfigRegistry.register
 def qwen3_1p7b():
   config = qwen3_0p6b()
   return dataclasses.replace(
@@ -2032,6 +2065,9 @@ def dlm_test():
   config = lm_test()
   return dataclasses.replace(
       config,
+      batch_size=32,
+      num_train_steps=10_000,
+      vocab_size=32_768,
       train_loop_name='diffusion_lm',
       diffusion_time_epsilon=1e-5,
       diffusion_seed=42,
