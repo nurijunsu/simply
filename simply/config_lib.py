@@ -1737,38 +1737,6 @@ def qwen3_0p6b():
 
 
 @ExperimentConfigRegistry.register
-def qwen3_0p6b_dlm_c4_qwen3():
-  """Diffusion pretraining with Qwen3 tokenizer on C4."""
-  config = qwen3_0p6b()
-  return dataclasses.replace(
-      config,
-      train_loop_name='diffusion_lm',
-      dataset_name='c4.qwen3',
-      dataset_config='c4.qwen3',
-      diffusion_mask_token_id=QWEN3_VISION_PAD_ID,
-      use_validation_set=False,
-  )
-
-
-@ExperimentConfigRegistry.register
-def qwen3_0p6b_dlm_sft_tulu_v2_qwen3():
-  """Diffusion SFT with Qwen3 tokenizer on Tulu v2 SFT."""
-  config = qwen3_0p6b_dlm_c4_qwen3()
-  return dataclasses.replace(
-      config,
-      num_train_steps=2000,
-      lr=opt_lib.LinearWarmupCosineDecay(
-          value=1e-4,
-          warmup_steps=100,
-          steps_after_decay=10,
-          end_decay=0.1,
-      ),
-      dataset_name='tulu_v2_sft.qwen3',
-      dataset_config='tulu_v2_sft.qwen3',
-  )
-
-
-@ExperimentConfigRegistry.register
 def qwen3_1p7b():
   config = qwen3_0p6b()
   return dataclasses.replace(
@@ -1880,6 +1848,56 @@ def qwen3_30b_a3b_thinking_2507():
       init_ckpt_dir=QWEN3_30B_A3B_THINKING_2507_CKPT_DIR,
   )
 
+@ExperimentConfigRegistry.register
+def qwen3_0p6b_dlm_c4():
+  """Diffusion pretraining with Qwen3 tokenizer on C4."""
+  config = qwen3_0p6b()
+  return dataclasses.replace(
+      config,
+      train_loop_name='diffusion_lm',
+      dataset_name='c4.qwen3',
+      dataset_config='c4.qwen3',
+      diffusion_mask_token_id=QWEN3_VISION_PAD_ID,
+      use_validation_set=False,
+  )
+
+
+@ExperimentConfigRegistry.register
+def qwen3_0p6b_dlm_sft_tulu_v2():
+  """Diffusion SFT with Qwen3 tokenizer on Tulu v2 SFT."""
+  config = qwen3_0p6b_dlm_c4()
+  return dataclasses.replace(
+      config,
+      num_train_steps=2000,
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=1e-4,
+          warmup_steps=100,
+          steps_after_decay=10,
+          end_decay=0.1,
+      ),
+      dataset_name='tulu_v2_sft.qwen3',
+      dataset_config='tulu_v2_sft.qwen3',
+  )
+
+@ExperimentConfigRegistry.register
+def qwen3_235b_a22b() -> BaseExperimentConfig:
+  return dataclasses.replace(
+      qwen3_30b_a3b(),
+      model_dim=4096,
+      ffn_expand_dim=1536,
+      n_heads=64,
+      n_layers=94,
+      init_ckpt_dir=QWEN3_235B_A22B_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def qwen3_235b_a22b_thinking_2507() -> BaseExperimentConfig:
+  return dataclasses.replace(
+      qwen3_235b_a22b(),
+      position_encoding=pe_lib.RoPE(max_timescale=5_000_000),
+      init_ckpt_dir=QWEN3_235B_A22B_THINKING_2507_CKPT_DIR,
+  )
 
 @ExperimentConfigRegistry.register
 def qwen3_235b_a22b() -> BaseExperimentConfig:
