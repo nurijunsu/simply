@@ -1057,7 +1057,7 @@ class DLMInterface:
     while position < decoding_schedule.end_position:
       print(position, decoding_schedule.end_position)
       chunk_size = sampling_params.chunk_size
-      length = decoding_schedule.get_next_length(position + chunk_size)
+      length = decoding_schedule.get_next_length(position + chunk_size) + 1
       print(length)
       sampling_state = self.mask_and_pad_to(
           sampling_state,
@@ -1085,7 +1085,7 @@ class DLMInterface:
       print(position)
       if jax.device_get(sampling_state.all_has_ended):
         break
-      mask_all = bool(length >= decoding_schedule.end_position)
+      mask_all = bool(length >= decoding_schedule.end_position + 1)
       print(mask_all)
     # Post process the outputs.
     all_raw_token_ids = jax.experimental.multihost_utils.process_allgather(
