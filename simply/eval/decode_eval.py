@@ -32,6 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 from simply import config_lib
 from simply import data_lib
+from simply import diffusion_lm_lib
 from simply import model_lib
 from simply.utils import checkpoint_lib
 from simply.utils import common
@@ -120,6 +121,18 @@ _INTERMEDIATE_DECODE_STEPS = flags.DEFINE_integer(
     4096,
     'Intermediate decode steps for the model. Though it is optional, it is'
     ' recommended to set it to frame the jit into limited programs.',
+)
+
+_DIFFUSION_CHUNK_SIZE = flags.DEFINE_integer(
+    'diffusion_chunk_size',
+    0,
+    'Chunk size for diffusion sampling. If <= 0, use the model default.',
+)
+
+_DIFFUSION_STEPS = flags.DEFINE_integer(
+    'diffusion_steps',
+    128,
+    'Number of diffusion steps for sampling.',
 )
 
 _LM_FORMAT = flags.DEFINE_string(
@@ -247,15 +260,37 @@ def main(argv: Sequence[str]) -> None:
     vocab_name = config.vocab_name
   tokenizer = tokenization.TokenizerRegistry.get_instance(vocab_name)
 
-  default_sampling_params = model_lib.SamplingParams(
-      temperature=_TEMPERATURE.value,
-      top_k=_TOP_K.value,
-      top_p=_TOP_P.value,
-      max_seq_len=_MAX_SEQ_LEN.value,
-      max_decode_steps=_MAX_DECODE_STEPS.value,
-      num_samples=1,
-      intermediate_decode_steps=_INTERMEDIATE_DECODE_STEPS.value,
-      prefill_size=_PREFILL_SIZE.value,
+  is_diffusion = config.train_loop_name == 'diffusion_lm'
+  mask_token_id = None
+  if is_diffusion:
+    if config.diffusion_mask_token_id >= 0:
+      mask_token_id = config.diffusion_mask_token_id
+    else:
+      mask_token_id = diffusion_lm_lib._resolve_mask_token_id(config)
+    chunk_size = _DIFFUSION_CHUNK_SIZE.value
+    if chunk_size <= 0:
+      chunk_size = diffusion_lm_lib.DiffusionSamplingParams().chunk_size
+    default_sampling_params = diffusion_lm_lib.DiffusionSamplingParams(
+        temperature=_TEMPERATURE.value,
+        max_decode_steps=_MAX_DECODE_STEPS.value,
+        num_samples=1,
+        chunk_size=chunk_size,
+        steps=_DIFFUSION_STEPS.value,
+        scheduler_name=config.diffusion_alpha_scheduler
+        or 'LinearAlphaScheduler',
+        right_shift_logits=config.diffusion_right_shift,
+        mask_token_id=mask_token_id,
+    )
+  else:
+    default_sampling_params = model_lib.SamplingParams(
+        temperature=_TEMPERATURE.value,
+        top_k=_TOP_K.value,
+        top_p=_TOP_P.value,
+        max_seq_len=_MAX_SEQ_LEN.value,
+        max_decode_steps=_MAX_DECODE_STEPS.value,
+        num_samples=1,
+        intermediate_decode_steps=_INTERMEDIATE_DECODE_STEPS.value,
+        prefill_size=_PREFILL_SIZE.value,
   )
 
   lm_format = lm_format_lib.LMFormatRegistry.get_instance(lm_format_name)
@@ -268,12 +303,20 @@ def main(argv: Sequence[str]) -> None:
       pad_id_override=lm_format.pad_id,
       extra_eos_tokens=lm_format.extra_eos_tokens,
   )
-  lm_interface = model_lib.LMInterface(
-      model,
-      params=params,
-      input_processor=input_processor,
-      default_sampling_params=default_sampling_params,
-  )
+  if is_diffusion:
+    lm_interface = diffusion_lm_lib.DLMInterface(
+        model,
+        params=params,
+        input_processor=input_processor,
+        default_sampling_params=default_sampling_params,
+    )
+  else:
+    lm_interface = model_lib.LMInterface(
+        model,
+        params=params,
+        input_processor=input_processor,
+        default_sampling_params=default_sampling_params,
+    )
 
   if (seed := _SEED.value) is None:
     seed = int(time.time() * 1000)
@@ -327,12 +370,19 @@ def main(argv: Sequence[str]) -> None:
 
     start_time = time.time()
     prng_key, subkey = jax.random.split(prng_key)
-    sampling_outputs = lm_interface.generate(
-        sampling_inputs,
-        prng_key=subkey,
-        batch_size=_BATCH_SIZE.value,
-        scoring_inputs=False,
-    )
+    if is_diffusion:
+      sampling_outputs = lm_interface.generate(
+          sampling_inputs,
+          prng_key=subkey,
+          batch_size=_BATCH_SIZE.value,
+      )
+    else:
+      sampling_outputs = lm_interface.generate(
+          sampling_inputs,
+          prng_key=subkey,
+          batch_size=_BATCH_SIZE.value,
+          scoring_inputs=False,
+      )
     generation_time = time.time() - start_time
     logging.info(
         'Generated batch %d - %d, used %.2f seconds.',
