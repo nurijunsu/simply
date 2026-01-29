@@ -14,7 +14,12 @@
 ```shell
 EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config lm_test --experiment_dir /tmp/${EXP} --alsologtostderr
 ```
-Or if you want to debug by printing arrays like normal python code, you can disable `jit` and `use_scan` using the command below.
+To test training with diffusion language models, use the command
+```shell
+EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config dlm_test --experiment_dir /tmp/${EXP} --alsologtostderr
+```
+
+If you want to debug by printing arrays like normal python code, you can disable `jit` and `use_scan` using the command below.
 
 ```shell
 export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config lm_no_scan_test --experiment_dir /tmp/${EXP} --alsologtostderr

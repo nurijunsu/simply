@@ -48,9 +48,9 @@ PRNGKey = jax.typing.ArrayLike
 PyTree = common.PyTree
 Array = common.Array
 SamplingParams = sampling_lib.SamplingParams
+compute_log_likelihood = sampling_lib.compute_log_likelihood
 SamplingState = model_lib.SamplingState
 SamplingOutput = model_lib.SamplingOutput
-compute_log_likelihood = model_lib.compute_log_likelihood
 pad_along_axis = model_lib.pad_along_axis
 CollectExtraLossFn = Callable[[Any], tuple[jnp.ndarray, dict[str, Any]]]
 
@@ -587,7 +587,7 @@ def run_experiment(
     logging.info('Training is early stopped!')
   helper.close(final_result)
   return final_result
-  
+
 
 @dataclasses.dataclass(frozen=True)
 class DiffusionSamplingParams(sampling_lib.SamplingParams):
@@ -642,7 +642,6 @@ def _reverse_transfer_probabilities(
   reverse_mask_prob = (1 - alpha_s) / (1 - alpha_t)
   return 1 - reverse_mask_prob
 
-# TODO(kimjunsu) continue decode doesnt decode all masked tokens. Identify why. 
 def continue_decode(
     apply_fn: Callable[..., Array],
     params: PyTree,
@@ -817,7 +816,7 @@ class DiffusionSamplingState(model_lib.SamplingState):
       first_nonpad = jnp.argmax(~rev_pad, axis=1)
       trailing_pad = jnp.where(has_nonpad, first_nonpad, seq_len)
       mask_len = jnp.where(
-          trailing_pad > mask_block_size, mask_block_size, 0
+          trailing_pad >= mask_block_size, mask_block_size, 0
       )
       mask_start = seq_len - trailing_pad
       pos_idx = jnp.arange(seq_len)[None, :]
@@ -938,7 +937,7 @@ class DLMInterface:
         token.
       batch_size: The batch size to use for the generation. If not specified,
         the batch size will be inferred from the length of the input text.
-        
+
     Returns:
       If the `input_text` is a single text string or a single raw sequence,
       returns a list of `SamplingOutput`, else if the `input_text` is a
@@ -1014,7 +1013,7 @@ class DLMInterface:
         ),
         pad_id=self.input_processor.pad_id,
     )
-    
+
     if sampling_params.num_samples > 1:
       processed_input = processed_input.repeat(sampling_params.num_samples)
 

@@ -76,7 +76,7 @@ GEMMA3_VOCAB = os.path.join(VOCABS_DIR, 'gemma3_cleaned_262144_v2.spiece.model')
 QWEN2P5_VOCAB = os.path.join(VOCABS_DIR, 'Qwen2.5-32B')
 QWQ_VOCAB = os.path.join(VOCABS_DIR, 'QwQ-32B')
 DEEPSEEK_R1_DISTILL_QWEN_VOCAB = os.path.join(VOCABS_DIR, 'DeepSeek-R1-Distill-Qwen-32B')
-QWEN3_VOCAB = os.path.join(VOCABS_DIR, 'Qwen3-32B')
+QWEN3_VOCAB = os.path.join(VOCABS_DIR, 'Qwen3')
 
 
 OPENMIX_V1_VOCABS = [
@@ -356,7 +356,7 @@ class MixtureConfig:
 ################################################################################
 
 
-@DataConfigRegistry.register(name='c4.qwen3')
+@functools.partial(DataConfigRegistry.register, name='c4.qwen3')
 def c4_qwen3() -> DatasetConfig:
   """C4 pretraining dataset config using Qwen3 tokenizer."""
   return DatasetConfig(
@@ -370,7 +370,7 @@ def c4_qwen3() -> DatasetConfig:
   )
 
 
-@DataConfigRegistry.register(name='tulu_v2_sft.qwen3')
+@functools.partial(DataConfigRegistry.register, name='tulu_v2_sft.qwen3')
 def tulu_v2_sft_qwen3() -> DatasetConfig:
   """Tulu v2 SFT dataset config using Qwen3 chat formatting."""
   return DatasetConfig(
