@@ -421,6 +421,14 @@ class TuluV2SFTSource:
     return self._examples[index]
 
 
+@functools.partial(DataSourceRegistry.register, name='tulu_v2_sft_test')
+@dataclasses.dataclass(frozen=True)
+class TuluV2SFTTestSource(TuluV2SFTSource):
+  """Tulu v2 SFT test dataset source from TFRecord files."""
+
+  path: str = os.path.join(DATASETS_DIR, 'tulu-v2-sft-mixture/test.tfrecord')
+
+
 ################################################################################
 # JSON data sources (for evaluation/RL).
 ################################################################################

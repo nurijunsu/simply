@@ -1758,20 +1758,23 @@ def qwen3_0p6b_dlm_sft_tulu_v2():
   config = qwen3_0p6b_dlm_c4()
   return dataclasses.replace(
       config,
-      seq_len = 128,
-      batch_size = 4,
-      num_train_steps=25000,
+      seq_len=128,
+      batch_size=8,
+      num_train_steps=10000,
       prefetch_num_workers=0,
       prefetch_per_worker_buffer_size=1,
       lr=opt_lib.LinearWarmupCosineDecay(
-          value=1e-4,
+          value=2e-5,
           warmup_steps=100,
           steps_after_decay=10,
           end_decay=0.1,
       ),
       dataset_name='tulu_v2_sft.qwen3',
       dataset_config='tulu_v2_sft.qwen3',
+      use_validation_set=False,
+      grad_accum_steps=2,
   )
+
 
 @ExperimentConfigRegistry.register
 def qwen3_1p7b():

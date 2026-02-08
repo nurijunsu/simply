@@ -779,9 +779,9 @@ class DiffusionSamplingState(model_lib.SamplingState):
     """Pads to `length` and masks a trailing pad block for diffusion decoding.
 
     If `mask_all` is False, pads tokens/logprobs/scores to `length`, then masks
-    up to `mask_block_size` trailing pad positions (if at least that many pads
-    exist). If `mask_all` is True, does not pad and instead masks all existing
-    pad positions.
+    `mask_block_size` trailing pad positions only when trailing pads are more
+    than `mask_block_size`. If `mask_all` is True, does not pad and instead
+    masks all existing pad positions.
 
     Args:
       length: Target sequence length to pad to when `mask_all` is False.
@@ -798,7 +798,9 @@ class DiffusionSamplingState(model_lib.SamplingState):
     token_scores = self.token_scores 
 
     if not mask_all:
-      tokens = model_lib.pad_to_along_axis(tokens, length, axis=1)
+      tokens = model_lib.pad_to_along_axis(
+          tokens, length, axis=1, constant_values=pad_id
+      )
       token_logprobs = model_lib.pad_to_along_axis(
           token_logprobs, length, axis=1
       )
@@ -815,9 +817,7 @@ class DiffusionSamplingState(model_lib.SamplingState):
       has_nonpad = jnp.any(~rev_pad, axis=1)
       first_nonpad = jnp.argmax(~rev_pad, axis=1)
       trailing_pad = jnp.where(has_nonpad, first_nonpad, seq_len)
-      mask_len = jnp.where(
-          trailing_pad >= mask_block_size, mask_block_size, 0
-      )
+      mask_len = jnp.where(trailing_pad > mask_block_size, mask_block_size, 0)
       mask_start = seq_len - trailing_pad
       pos_idx = jnp.arange(seq_len)[None, :]
       mask_indices = (
@@ -1053,7 +1053,7 @@ class DLMInterface:
         'sampling_params.max_seq_len: %d', sampling_params.max_seq_len
     )
     mask_all = False
-    while position < decoding_schedule.end_position:
+    while True:
       chunk_size = sampling_params.chunk_size
       length = decoding_schedule.get_next_length(position + chunk_size) + 1
       sampling_state = self.mask_and_pad_to(
@@ -1079,7 +1079,7 @@ class DLMInterface:
           scheduler_name=sampling_params.scheduler_name,
       )
       position = jax.device_get(sampling_state.position)
-      if jax.device_get(sampling_state.all_has_ended):
+      if jax.device_get(sampling_state.all_has_ended) or mask_all:
         break
       mask_all = bool(length >= decoding_schedule.end_position + 1)
     # Post process the outputs.
